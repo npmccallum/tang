@@ -1,0 +1,82 @@
+#!/usr/bin/env python
+
+import jose.jwk
+import jose.jws
+
+import copy
+import json
+import os
+import sys
+
+HASHES = ['sha1', 'sha224', 'sha256', 'sha384', 'sha512']
+
+def atomic_link(src, dst):
+    tmp = os.path.join(os.path.dirname(dst), '.' + os.path.basename(dst))
+    os.symlink(src, tmp)
+    os.rename(tmp, dst)
+
+def atomic_write(obj, dst):
+    tmp = os.path.join(os.path.dirname(dst), '.' + os.path.basename(dst))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT)
+    os.write(fd, json.dumps(keyset, sort_keys=True, separators=(',',':')))
+    os.close(fd)
+    os.rename(tmp, dst)
+
+jwkd, advd, recd = sys.argv[1:]
+advs = set(["default"])
+recs = set()
+
+# Load in all keys
+jwks = {}
+for name in os.listdir(jwkd):
+    path = os.path.join(jwkd, name)
+
+    with open(path) as f:
+        jwks[name] = json.load(f)
+
+    # Symlink recovery keys by their KID
+    if jose.jwk.allowed(jwks[name], req=True, op='deriveKey'):
+        for hsh in HASHES:
+            thp = jose.jwk.thumbprint(jwks[name], hsh)
+            atomic_link(path, os.path.join(recd, thp))
+            recs.add(thp)
+
+# Create the default advertisement
+keyset = {"keys": [v for k, v in jwks.items() if not k.startswith('.')]}
+adv = {"payload": json.dumps(keyset, sort_keys=True, separators=(',',':'))}
+
+for jwk in keyset["keys"]:
+    if jose.jwk.allowed(v, req=True, op='sign'):
+        jose.jws.sign(adv, v)
+
+atomic_write(adv, os.path.join(advd, "default"))
+
+# Create the key-specific advertisements
+for k, v in jwks.items():
+    if not jose.jwk.allowed(v, req=True, op='sign'):
+        continue
+
+    kid = jose.jwk.thumbprint(v, HASHES[0])
+    jws = copy.deepcopy(adv)
+    advs.add(kid)
+
+    if k.startswith('.'):
+        jose.jws.sign(jws, v)
+        atomic_write(jws, os.path.join(advd, kid))
+    else:
+        atomic_link("default", os.path.join(advd, kid))
+        kid = "default"
+
+    for hsh in HASHES[1:]:
+        thp = jose.jwk.thumbprint(v, hsh)
+        atomic_link(kid, os.path.join(advd, thp))
+        advs.add(thp)
+
+# Remove old data
+for name in os.listdir(advd):
+    if name not in advs:
+        os.remove(os.path.join(advd, name))
+
+for name in os.listdir(recd):
+    if name not in recs:
+        os.remove(os.path.join(recd, name))
