@@ -1,0 +1,48 @@
+#!/bin/bash -e
+
+HASHES=`jose sup | sed -n 's|^jwk_hasher: ||p' | sed 's|,||g'`
+
+for jwk in `realpath "$1"`/*.jwk; do
+  pub=`jose pub -i "$jwk"`
+
+  if jose use -i "$jwk" -r -o sign -o verify; then
+    payl="$payl,$pub"
+    skey="$skey -k \"$jwk\""
+  elif jose use -i "$jwk" -r -o deriveKey; then
+    payl="$payl,$pub"
+  else
+    echo "Skipping invalid key: $jwk" >&2
+  fi
+done
+
+payl="{\"keys\":[${payl:1}]}"
+
+if [ ! "$skey" ]; then
+  echo "No advertised signing keys found!"
+  exit 1
+fi
+
+echo "$payl" | jose sig -i- $skey -o "$2/.default.jws"
+mv -f "$2/.default.jws" "$2/default.jws"
+new=default.jws
+
+for jwk in `realpath "$1"`/*.jwk `realpath "$1"`/.*.jwk; do
+  for hsh in $HASHES; do
+    thp=`jose thp -i "$jwk" -H $hsh`
+
+    if jose use -i "$jwk" -r -o deriveKey; then
+      ln -sf "$jwk" "$2/.$thp.jwk"
+      mv -f "$2/.$thp.jwk" "$2/$thp.jwk"
+      new="$new\n$thp.jwk"
+    elif jose use -i "$jwk" -r -o sign; then
+      echo "$payl" | jose sig -i- -k "$jwk" -o "$2/.$thp.jws"
+      mv -f "$2/.$thp.jws" "$2/$thp.jws"
+      new="$new\n$thp.jws"
+    fi
+  done
+done
+
+for f in "$2"/*; do
+  b=`basename "$f"`
+  echo -e "$new" | grep -q "^$b\$" || rm -f "$f"
+done

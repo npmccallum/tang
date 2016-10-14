@@ -17,266 +17,169 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "plugin.h"
+#include "http.h"
 
-#include <http_parser.h>
-
-#include <sys/epoll.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <sys/un.h>
-
+#include <sys/stat.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <dlfcn.h>
-#include <errno.h>
-#include <signal.h>
-#include <stddef.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
-struct buffer {
-    uint8_t *data;
-    size_t size;
-    size_t used;
-};
+#include <jose/jose.h>
 
-struct request {
-    int status;
-    char path[1024 * 4];
-    char body[1024 * 64];
-};
+static const char *cachedir;
 
-_EXPORT_ struct tang_plugin_map *tang_plugin_maps = NULL;
-
-static const char *METHOD_NAMES[] = {
-#define XX(num, name, string) [num] = # string,
-HTTP_METHOD_MAP(XX)
-#undef XX
-    NULL
-};
-
-static int
-on_url(http_parser *parser, const char *at, size_t length)
+static void
+str_cleanup(char **str)
 {
-    struct request *req = parser->data;
+    if (str)
+        free(*str);
+}
 
-    if (req->status == 0) {
-        if (strlen(req->path) + length >= sizeof(req->path))
-            req->status = HTTP_STATUS_URI_TOO_LONG;
-        else
-            strncat(req->path, at, length);
-    }
-
-    return 0;
+static void
+FILE_cleanup(FILE **file)
+{
+    if (file && *file)
+        fclose(*file);
 }
 
 static int
-on_body(http_parser *parser, const char *at, size_t length)
+adv(enum http_method method, const char *path, const char *body,
+    regmatch_t matches[])
 {
-    struct request *req = parser->data;
+    __attribute__((cleanup(FILE_cleanup))) FILE *file = NULL;
+    __attribute__((cleanup(str_cleanup))) char *adv = NULL;
+    __attribute__((cleanup(str_cleanup))) char *thp = NULL;
+    char filename[PATH_MAX] = {};
+    struct stat st = {};
 
-    if (req->status == 0) {
-        if (strlen(req->body) + length >= sizeof(req->body))
-            req->status = HTTP_STATUS_PAYLOAD_TOO_LARGE;
-        else
-            strncat(req->body, at, length);
+    if (matches[1].rm_so < matches[1].rm_eo) {
+        size_t size = matches[1].rm_eo - matches[1].rm_so;
+        thp = strndup(&path[matches[1].rm_so], size);
+        if (!thp)
+            return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
     }
 
-    return 0;
+    if (snprintf(filename, sizeof(filename),
+                 "%s/%s.jws", cachedir, thp ? thp : "default") < 0)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+
+    file = fopen(filename, "r");
+    if (!file)
+        return http_reply(HTTP_STATUS_NOT_FOUND, NULL);
+
+    if (fstat(fileno(file), &st) != 0)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+
+    adv = malloc(st.st_size);
+    if (!adv)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+
+    if (fread(adv, st.st_size, 1, file) != 1)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+
+    return http_reply(HTTP_STATUS_OK,
+                      "Content-Type: application/jose+json\r\n"
+                      "Content-Length: %zu\r\n"
+                      "\r\n%s", strlen(adv), adv);
 }
 
 static int
-on_message_complete(http_parser *parser)
+rec(enum http_method method, const char *path, const char *body,
+    regmatch_t matches[])
 {
-    struct request *req = parser->data;
-    const char *addr = NULL;
-    bool pathmatch = false;
-    bool methmatch = false;
-    int r = 0;
+    __attribute__((cleanup(str_cleanup))) char *enc = NULL;
+    __attribute__((cleanup(str_cleanup))) char *thp = NULL;
+    size_t size = matches[1].rm_eo - matches[1].rm_so;
+    char filename[PATH_MAX] = {};
+    json_auto_t *jwk = NULL;
+    json_auto_t *req = NULL;
+    json_auto_t *rep = NULL;
+    const char *kty = NULL;
 
-    if (req->status != 0)
-        goto error;
+    req = json_loads(body, 0, NULL);
+    if (!req)
+        return http_reply(HTTP_STATUS_BAD_REQUEST, NULL);
 
-    addr = getenv("REMOTE_ADDR");
-    fprintf(stderr, "%s %s %s",
-            addr ? addr : "<unknown>",
-            METHOD_NAMES[parser->method],
-            req->path);
+    if (json_unpack(req, "{s:s}", "kty", &kty) != 0)
+        return http_reply(HTTP_STATUS_BAD_REQUEST, NULL);
 
-    for (struct tang_plugin_map *m = tang_plugin_maps;
-         m && r == 0; m = m->next) {
-        regmatch_t match[m->nmatches];
-        regex_t re = {};
+    if (strcmp(kty, "EC") != 0)
+        return http_reply(HTTP_STATUS_BAD_REQUEST, NULL);
 
-        memset(match, 0, sizeof(match));
+    thp = strndup(&path[matches[1].rm_so], size);
+    if (!thp)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
 
-        r = regcomp(&re, m->re, REG_EXTENDED) == 0 ? 0 : -EINVAL;
-        if (r == 0) {
-            if (regexec(&re, req->path, m->nmatches, match, 0) == 0) {
-                pathmatch = true;
+    if (snprintf(filename, sizeof(filename),
+                 "%s/%s.jws", cachedir, thp ? thp : "default") < 0)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
 
-                if (((1 << parser->method) & m->methods) != 0) {
-                    methmatch = true;
+    jwk = json_load_file(filename, 0, NULL);
+    if (!jwk)
+        return http_reply(HTTP_STATUS_NOT_FOUND, NULL);
 
-                    r = m->func(parser->method, req->path, req->body, match);
-                }
-            }
+    if (!jose_jwk_allowed(jwk, true, "deriveKey"))
+        return http_reply(HTTP_STATUS_FORBIDDEN, NULL);
 
-            regfree(&re);
-        }
-    }
+    rep = jose_jwk_exchange(jwk, req);
+    if (!rep)
+        return http_reply(HTTP_STATUS_BAD_REQUEST, NULL);
 
-    if (r > 0)
-        goto egress;
+    enc = json_dumps(rep, JSON_SORT_KEYS | JSON_COMPACT);
+    if (!enc)
+        return http_reply(HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
 
-    if (r == 0) {
-        if (!pathmatch)
-            req->status = HTTP_STATUS_NOT_FOUND;
-        else if (!methmatch)
-            req->status = HTTP_STATUS_METHOD_NOT_ALLOWED;
-        else
-            req->status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
-    } else {
-        req->status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
-    }
-
-error:
-    tang_reply(req->status, NULL);
-
-egress:
-    memset(req, 0, sizeof(*req));
-    return 0;
+    return http_reply(HTTP_STATUS_OK,
+                      "Content-Type: application/jwk+json\r\n"
+                      "Content-Length: %zu\r\n"
+                      "\r\n%s", strlen(enc), enc);
 }
 
-static const http_parser_settings parser_settings = {
-    .on_url = on_url,
-    .on_body = on_body,
-    .on_message_complete = on_message_complete,
+static struct http_dispatch dispatch[] = {
+    { adv, 1 << HTTP_GET,  2, "^/+adv/+([0-9A-Za-z_-]+)$" },
+    { adv, 1 << HTTP_GET,  2, "^/+adv/*$" },
+    { rec, 1 << HTTP_POST, 2, "^/+rec/+([0-9A-Za-z_-]+)$" },
+    {}
 };
-
-static int
-plugin_load(int epoll, const char *path, const char *cfg, void **dll)
-{
-    typeof(tang_plugin_init) *func = NULL;
-    int r = 0;
-
-    *dll = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!*dll) {
-        fprintf(stderr, "Plugin load error: %s: %s\n", path, dlerror());
-        return -ENOENT;
-    }
-
-    func = dlsym(*dll, "tang_plugin_init");
-    if (func) {
-        r = func(epoll, cfg);
-        if (r < 0) {
-            fprintf(stderr, "Plugin init error: %s: %s\n", path, strerror(-r));
-            dlclose(*dll);
-            *dll = NULL;
-            return r;
-        }
-    }
-
-    return 0;
-}
 
 int
 main(int argc, char *argv[])
 {
-    static const int sigs[] = { SIGTERM, SIGINT };
-    struct http_parser parser = {};
-    struct request request = {};
-    void *dlls[argc / 2 + 1];
+    struct http_request request = { .dispatch = dispatch };
+    struct http_parser parser = { .data = &request };
     char req[4096] = {};
     size_t rcvd = 0;
-    int epoll = -1;
-    sigset_t ss;
     int r = 0;
 
-    memset(dlls, 0, sizeof(dlls));
-
     http_parser_init(&parser, HTTP_REQUEST);
-    parser.data = &request;
 
-    if (argc < 2 || argc % 2 != 1) {
-        fprintf(stderr, "Usage: %s MOD CFG [MOD CFG ...]\n", argv[0]);
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <cachedir>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    if (sigfillset(&ss) < 0)
-        return EXIT_FAILURE;
+    cachedir = argv[1];
 
-    if (sigprocmask(SIG_SETMASK, &ss, NULL) < 0)
-        return EXIT_FAILURE;
-
-    for (size_t i = 0; i < sizeof(sigs) / sizeof(*sigs); i++) {
-        if (sigdelset(&ss, sigs[i]) < 0)
-            return EXIT_FAILURE;
-    }
-
-    epoll = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll < 0)
-        return EXIT_FAILURE;
-
-    for (size_t i = 0; (int) i * 2 + 1 < argc; i++) {
-        r = plugin_load(epoll, argv[i * 2 + 1], argv[i * 2 + 2], &dlls[i]);
+    for (;;) {
+        r = read(STDIN_FILENO, &req[rcvd], sizeof(req) - rcvd - 1);
+        if (r == 0)
+            return rcvd > 0 ? EXIT_FAILURE : EXIT_SUCCESS;
         if (r < 0)
-            goto egress;
-    }
+            return EXIT_FAILURE;
 
-    r = epoll_ctl(epoll, EPOLL_CTL_ADD, STDIN_FILENO,
-                  &(struct epoll_event) { .events = EPOLLIN | EPOLLPRI });
-    if (r < 0) {
-        fprintf(stderr, "Error setting adding IO listener.\n");
-        goto egress;
-    }
+        rcvd += r;
 
-    for (struct epoll_event event = {};
-         epoll_pwait(epoll, &event, 1, -1, &ss) == 1; ) {
-        tang_plugin_epoll func = event.data.ptr;
-
-        if (func) {
-            func();
-            continue;
+        r = http_parser_execute(&parser, &http_settings, req, rcvd);
+        if (parser.http_errno != 0) {
+            fprintf(stderr, "HTTP Parsing Error: %s\n",
+                    http_errno_description(parser.http_errno));
+            return EXIT_FAILURE;
         }
 
-        if (event.events & EPOLLIN) {
-            r = read(STDIN_FILENO, &req[rcvd], sizeof(req) - rcvd - 1);
-            if (r <= 0) {
-                if (r < 0)
-                    r = -errno;
-                else if (rcvd > 0)
-                    r = -EIO;
-                break;
-            }
-
-            rcvd += r;
-
-            r = http_parser_execute(&parser, &parser_settings, req, rcvd);
-            if (parser.http_errno != 0) {
-                fprintf(stderr, "HTTP Parsing Error: %s\n",
-                        http_errno_description(parser.http_errno));
-                r = -EINVAL;
-                break;
-            }
-
-            memmove(req, &req[r], rcvd - r);
-            rcvd -= r;
-        }
-
-        if (event.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-            r = rcvd == 0 ? 0 : -EIO;
-            break;
-        }
+        memmove(req, &req[r], rcvd - r);
+        rcvd -= r;
     }
-
-egress:
-    for (size_t i = 0; dlls[i]; i++)
-        dlclose(dlls[i]);
-
-    close(epoll);
-    return r == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

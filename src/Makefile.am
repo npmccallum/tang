@@ -1,28 +1,23 @@
-AM_CFLAGS = @TANG_CFLAGS@ @jose_CFLAGS@ @jose_openssl_CFLAGS@ -fvisibility=hidden
+AM_CFLAGS = @TANG_CFLAGS@ @jose_zlib_CFLAGS@ @jose_openssl_CFLAGS@
 
-tangdbdir = $(localstatedir)/db/$(PACKAGE_NAME)
-plugindir = $(libdir)/tang/plugins
+jwkdir = $(localstatedir)/db/$(PACKAGE_NAME)
+cachedir = $(localstatedir)/cache/$(PACKAGE_NAME)
 
 systemdsystemunit_DATA = tangd.socket tangd.service
 EXTRA_DIST = tangd.socket.in tangd.service.in
 CLEANFILES = tangd.socket tangd.service
 
 libexec_PROGRAMS = tangd
-tangd_SOURCES = db.c db.h plugin.c plugin.h tangd.c adv.c rec.c
-tangd_CFLAGS = $(AM_CFLAGS) -rdynamic
-tangd_LDADD = @jose_LIBS@ @http_parser_LIBS@ @dl_LIBS@
-
-plugin_LTLIBRARIES = dbdir.la
-dbdir_la_LIBADD = @jose_openssl_LIBS@ @jose_zlib_LIBS@
-dbdir_la_LDFLAGS = -module -avoid-version
+tangd_SOURCES = http.c http.h tangd.c
+tangd_LDADD = @jose_zlib_LIBS@ @jose_openssl_LIBS@ @http_parser_LIBS@
 
 install-data-hook:
-	mkdir -p $(DESTDIR)$(tangdbdir)/keys
-	mkdir -p $(DESTDIR)$(tangdbdir)/blst
+	mkdir -p $(DESTDIR)$(jwkdir)
+	mkdir -p $(DESTDIR)$(cachedir)
 
 %: %.in
 	$(AM_V_GEN)$(SED) \
 		-e 's,@libexecdir\@,$(libexecdir),g' \
-		-e 's,@tangdbdir\@,$(tangdbdir),g' \
-		-e 's,@plugindir\@,$(plugindir),g' \
+		-e 's,@jwkdir\@,$(jwkdir),g' \
+		-e 's,@cachedir\@,$(cachedir),g' \
 		$(srcdir)/$@.in > $@

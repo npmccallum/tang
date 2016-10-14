@@ -19,8 +19,6 @@
 
 #pragma once
 
-#include "db.h"
-
 #include <http_parser.h>
 #include <sys/types.h>
 #include <regex.h>
@@ -95,25 +93,26 @@ enum http_status
   };
 #endif
 
-struct tang_plugin_map {
+struct http_dispatch {
     int (*func)(enum http_method method, const char *path,
                 const char *body, regmatch_t matches[]);
     uint64_t methods;
     size_t nmatches;
     const char *re;
-    struct tang_plugin_map *next;
 };
 
-typedef void (*tang_plugin_epoll)(void);
+struct http_request {
+    const struct http_dispatch *dispatch;
+    int status;
+    char path[1024 * 4];
+    char body[1024 * 64];
+};
 
-extern struct tang_plugin_map *tang_plugin_maps;
-
-extern int
-tang_plugin_init(int epoll, const char *cfg);
+extern const http_parser_settings http_settings;
 
 int __attribute__ ((format(printf, 4, 5)))
-tang_reply(const char *file, int line,
+http_reply(const char *file, int line,
            enum http_status code, const char *fmt, ...);
 
-#define tang_reply(code, ...) \
-    tang_reply(__FILE__, __LINE__, code, __VA_ARGS__)
+#define http_reply(code, ...) \
+    http_reply(__FILE__, __LINE__, code, __VA_ARGS__)
